@@ -137,6 +137,7 @@ OUTBOUND_IP_RANGES_INCLUDE=${ISTIO_SERVICE_CIDR-}
 OUTBOUND_IP_RANGES_EXCLUDE=${ISTIO_SERVICE_EXCLUDE_CIDR-}
 OUTBOUND_PORTS_EXCLUDE=${ISTIO_LOCAL_OUTBOUND_PORTS_EXCLUDE-}
 KUBEVIRT_INTERFACES=
+ENABLE_INBOUND_IPV6=
 
 while getopts ":p:z:u:g:m:b:d:o:i:x:k:ht" opt; do
   case ${opt} in
@@ -206,12 +207,20 @@ if [ -z "${PROXY_GID}" ]; then
 PROXY_GID=${PROXY_UID}
 fi
 
-POD_IP=$(hostname --ip-address)
-# Check if pod's ip is ipv4 or ipv6, in case of ipv6 set variable
-# to program ip6tables
-if isIPv6 "$POD_IP"; then
-  ENABLE_INBOUND_IPV6=$POD_IP
-fi
+# Check if any of the pod's ip addresses are ipv6. If so, set variable
+# to program ip6tables.
+#
+# The odd structure of this loop is to prevent the while loop from
+# executing in a subshell, which prevents ENABLE_INBOUND_IPV6 from
+# being set in the main script.
+while read -r POD_IP; do 
+  if isIPv6 "$POD_IP"; then
+    echo "Found ipv6 pod IP: ${POD_IP}"
+    ENABLE_INBOUND_IPV6="${POD_IP}"
+  else
+    echo "Found ipv4 pod IP: ${POD_IP}"
+  fi
+done <<< "$(ip -brief -oneline addr | awk '{print $3}' | sed 's|/.*||g')"
 
 #
 # Since OUTBOUND_IP_RANGES_EXCLUDE could carry ipv4 and ipv6 ranges
@@ -310,12 +319,7 @@ iptables -t nat -A ISTIO_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
 # when not using TPROXY.
 iptables -t nat -N ISTIO_IN_REDIRECT
 
-# PROXY_INBOUND_CAPTURE_PORT should be used only user explicitly set INBOUND_PORTS_INCLUDE to capture all
-if [ "${INBOUND_PORTS_INCLUDE}" == "*" ]; then
-  iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_INBOUND_CAPTURE_PORT}"
-else
-  iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
-fi
+iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_INBOUND_CAPTURE_PORT}"
 
 # Handling of inbound ports. Traffic will be redirected to Envoy, which will process and forward
 # to the local service. If not set, no inbound port will be intercepted by istio iptables.
@@ -364,7 +368,7 @@ if [ -n "${INBOUND_PORTS_INCLUDE}" ]; then
     if [ "${INBOUND_INTERCEPTION_MODE}" = "TPROXY" ]; then
       # If an inbound packet belongs to an established socket, route it to the
       # loopback interface.
-      iptables -t mangle -A ISTIO_INBOUND -p tcp -m socket -j ISTIO_DIVERT || echo "No socket match support"
+      iptables -t mangle -A ISTIO_INBOUND -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ISTIO_DIVERT || echo "No conntrack match support"
       # Otherwise, it's a new connection. Redirect it using TPROXY.
       iptables -t mangle -A ISTIO_INBOUND -p tcp -j ISTIO_TPROXY
     else
@@ -374,8 +378,7 @@ if [ -n "${INBOUND_PORTS_INCLUDE}" ]; then
     # User has specified a non-empty list of ports to be redirected to Envoy.
     for port in ${INBOUND_PORTS_INCLUDE}; do
       if [ "${INBOUND_INTERCEPTION_MODE}" = "TPROXY" ]; then
-        iptables -t mangle -A ISTIO_INBOUND -p tcp --dport "${port}" -m socket -j ISTIO_DIVERT || echo "No socket match support"
-        iptables -t mangle -A ISTIO_INBOUND -p tcp --dport "${port}" -m socket -j ISTIO_DIVERT || echo "No socket match support"
+        iptables -t mangle -A ISTIO_INBOUND -p tcp --dport "${port}" -m conntrack --ctstate RELATED,ESTABLISHED -j ISTIO_DIVERT || echo "No conntrack match support"
         iptables -t mangle -A ISTIO_INBOUND -p tcp --dport "${port}" -j ISTIO_TPROXY
       else
         iptables -t nat -A ISTIO_INBOUND -p tcp --dport "${port}" -j ISTIO_IN_REDIRECT
@@ -404,19 +407,29 @@ fi
 # 127.0.0.6 is bind connect from inbound passthrough cluster
 iptables -t nat -A ISTIO_OUTPUT -o lo -s 127.0.0.6/32 -j RETURN
 
-if [ -z "${DISABLE_REDIRECTION_ON_LOCAL_LOOPBACK-}" ]; then
-  # Redirect app calls back to itself via Envoy when using the service VIP or endpoint
-  # address, e.g. appN => Envoy (client) => Envoy (server) => appN.
-  iptables -t nat -A ISTIO_OUTPUT -o lo ! -d 127.0.0.1/32 -j ISTIO_IN_REDIRECT
-fi
-
 for uid in ${PROXY_UID}; do
+  # Redirect app calls back to itself via Envoy when using the service VIP
+  # e.g. appN => Envoy (client) => Envoy (server) => appN.
+  iptables -t nat -A ISTIO_OUTPUT -o lo ! -d 127.0.0.1/32 -m owner --uid-owner "${uid}" -j ISTIO_IN_REDIRECT
+
+  # Do not redirect app calls to back itself via Envoy when using the endpoint address
+  # e.g. appN => appN by lo
+  iptables -t nat -A ISTIO_OUTPUT -o lo -m owner ! --uid-owner "${uid}" -j RETURN
+
   # Avoid infinite loops. Don't redirect Envoy traffic directly back to
   # Envoy for non-loopback traffic.
   iptables -t nat -A ISTIO_OUTPUT -m owner --uid-owner "${uid}" -j RETURN
 done
 
 for gid in ${PROXY_GID}; do
+  # Redirect app calls back to itself via Envoy when using the service VIP
+  # e.g. appN => Envoy (client) => Envoy (server) => appN.
+  iptables -t nat -A ISTIO_OUTPUT -o lo ! -d 127.0.0.1/32 -m owner --gid-owner "${gid}" -j ISTIO_IN_REDIRECT
+
+  # Do not redirect app calls to back itself via Envoy when using the endpoint address
+  # e.g. appN => appN by lo
+  iptables -t nat -A ISTIO_OUTPUT -o lo -m owner ! --gid-owner "${gid}" -j RETURN
+
   # Avoid infinite loops. Don't redirect Envoy traffic directly back to
   # Envoy for non-loopback traffic.
   iptables -t nat -A ISTIO_OUTPUT -m owner --gid-owner "${gid}" -j RETURN
@@ -471,12 +484,7 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
   # Use this chain also for redirecting inbound traffic to the common Envoy port
   # when not using TPROXY.
   ip6tables -t nat -N ISTIO_IN_REDIRECT
-  # PROXY_INBOUND_CAPTURE_PORT should be used only user explicitly set INBOUND_PORTS_INCLUDE to capture all
-  if [ "${INBOUND_PORTS_INCLUDE}" == "*" ]; then
     ip6tables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_INBOUND_CAPTURE_PORT}"
-  else
-    ip6tables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
-  fi
 
   # Handling of inbound ports. Traffic will be redirected to Envoy, which will process and forward
   # to the local service. If not set, no inbound port will be intercepted by istio iptables.
@@ -494,6 +502,8 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
             ip6tables -t ${table} -A ISTIO_INBOUND -p tcp --dport "${port}" -j RETURN
         done
         fi
+        # Redirect other inbound traffic
+        ip6tables -t ${table} -A ISTIO_INBOUND -p tcp -j ISTIO_IN_REDIRECT
     else
         # User has specified a non-empty list of ports to be redirected to Envoy.
         for port in ${INBOUND_PORTS_INCLUDE}; do
@@ -519,17 +529,29 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
   # ::6 is bind when connect from inbound passthrough cluster
   ip6tables -t nat -A ISTIO_OUTPUT -o lo -s ::6/128 -j RETURN
 
-  # Redirect app calls to back itself via Envoy when using the service VIP or endpoint
-  # address, e.g. appN => Envoy (client) => Envoy (server) => appN.
-  ip6tables -t nat -A ISTIO_OUTPUT -o lo ! -d ::1/128 -j ISTIO_IN_REDIRECT
-
   for uid in ${PROXY_UID}; do
+    # Redirect app calls back to itself via Envoy when using the service VIP
+    # e.g. appN => Envoy (client) => Envoy (server) => appN.
+    ip6tables -t nat -A ISTIO_OUTPUT -o lo ! -d ::1/128 -m owner --uid-owner "${uid}" -j ISTIO_IN_REDIRECT
+
+    # Do not redirect app calls to back itself via Envoy when using the endpoint address
+    # e.g. appN => appN by lo
+    ip6tables -t nat -A ISTIO_OUTPUT -o lo -m owner ! --uid-owner "${uid}" -j RETURN
+
     # Avoid infinite loops. Don't redirect Envoy traffic directly back to
     # Envoy for non-loopback traffic.
     ip6tables -t nat -A ISTIO_OUTPUT -m owner --uid-owner "${uid}" -j RETURN
   done
 
   for gid in ${PROXY_GID}; do
+    # Redirect app calls back to itself via Envoy when using the service VIP
+    # e.g. appN => Envoy (client) => Envoy (server) => appN.
+    ip6tables -t nat -A ISTIO_OUTPUT -o lo ! -d ::1/128 -m owner --gid-owner "${gid}" -j ISTIO_IN_REDIRECT
+
+    # Do not redirect app calls to back itself via Envoy when using the endpoint address
+    # e.g. appN => appN by lo
+    ip6tables -t nat -A ISTIO_OUTPUT -o lo -m owner ! --gid-owner "${gid}" -j RETURN
+
     # Avoid infinite loops. Don't redirect Envoy traffic directly back to
     # Envoy for non-loopback traffic.
     ip6tables -t nat -A ISTIO_OUTPUT -m owner --gid-owner "${gid}" -j RETURN
@@ -568,8 +590,8 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
   fi
 else
   # Drop all inbound traffic except established connections.
-  ip6tables -F INPUT || true
-  ip6tables -A INPUT -m state --state ESTABLISHED -j ACCEPT || true
-  ip6tables -A INPUT -i lo -d ::1 -j ACCEPT || true
-  ip6tables -A INPUT -j REJECT || true
+  ip6tables -t filter -F INPUT || true
+  ip6tables -t filter -A INPUT -m state --state ESTABLISHED -j ACCEPT || true
+  ip6tables -t filter -A INPUT -i lo -d ::1 -j ACCEPT || true
+  ip6tables -t filter -A INPUT -j REJECT || true
 fi
