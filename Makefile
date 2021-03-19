@@ -50,25 +50,8 @@ ifeq ($(GO),)
   $(error Could not find 'go' in path.  Please install go, or if already installed either add it to your path or set GO to point to its directory)
 endif
 
-LOCAL_ARCH := $(shell uname -m)
-ifeq ($(LOCAL_ARCH),x86_64)
-GOARCH_LOCAL := amd64
-else
-GOARCH_LOCAL := $(LOCAL_ARCH)
-endif
-export GOARCH ?= $(GOARCH_LOCAL)
-
-LOCAL_OS := $(shell uname)
-ifeq ($(LOCAL_OS),Linux)
-   export GOOS_LOCAL = linux
-else ifeq ($(LOCAL_OS),Darwin)
-   export GOOS_LOCAL = darwin
-else
-   $(error "This system's OS $(LOCAL_OS) isn't recognized/supported")
-   # export GOOS_LOCAL ?= windows
-endif
-
-export GOOS ?= $(GOOS_LOCAL)
+export GOARCH ?= $(shell go env GOARCH)
+export GOOS ?= $(shell go env GOOS)
 
 export ENABLE_COREDUMP ?= false
 #-----------------------------------------------------------------------------
